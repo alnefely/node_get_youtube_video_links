@@ -2,10 +2,12 @@ const express = require('express');
 const ytdl = require('@distube/ytdl-core');
 const cors = require('cors');
 const fs = require('fs');
+const path = require('path');
+
 // Suppress warnings and prevent debug file creation
 process.removeAllListeners('warning');
-process.on('warning', () => {}); // Ignore all warnings
-console.warn = () => {}; // Disable console warnings
+process.on('warning', () => {});
+console.warn = () => {};
 
 // Safe way to disable ytdl-core debug features
 try {
@@ -22,6 +24,47 @@ const PORT = process.env.PORT || 3300;
 app.use(cors());
 app.use(express.json());
 
+// Create cookies array (هام جداً للسيرفرات الحقيقية)
+const cookies = [
+    {
+        name: 'VISITOR_INFO1_LIVE',
+        value: 'uDBFDVm3fnU', // ضع قيمة حقيقية
+        domain: '.youtube.com',
+        path: '/',
+        expires: Date.now() + 3600000 * 24 * 30,
+        httpOnly: true,
+        secure: true,
+        sameSite: 'None'
+    },
+    {
+        name: 'CONSENT',
+        value: '-5XUoAVv-vw', // أو قيمة حقيقية
+        domain: '.youtube.com',
+        path: '/',
+        expires: Date.now() + 3600000 * 24 * 30,
+        httpOnly: false,
+        secure: true,
+        sameSite: 'None'
+    }
+];
+
+// Create agent with proper configuration
+const agent = ytdl.createAgent(cookies, {
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0'
+    }
+});
+
 // Get video details
 app.get('/api/video/:videoId', async (req, res) => {
     try {
@@ -34,23 +77,33 @@ app.get('/api/video/:videoId', async (req, res) => {
             });
         }
 
-        // Configure ytdl with options to suppress warnings and debug files
+        // Configure ytdl with options
         const ytdlOptions = {
+            agent: agent, // استخدام الـ agent مع الـ cookies
             quality: 'highest',
             filter: 'audioandvideo',
             requestOptions: {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Referer': 'https://www.youtube.com/'
+                },
+                maxRetries: 3,
+                maxReconnects: 3,
+                backoff: { inc: 500, max: 10000 }
             },
-            // Disable debug file creation
             debug: false,
             silent: true,
-            // Prevent writing debug files
-            writeDebugFile: false
+            writeDebugFile: false,
+            highWaterMark: 1 << 25, // 32MB
+            dlChunkSize: 1024 * 1024 * 10, // 10MB
+            IPv6Block: '2001:2::/48' // يساعد في بعض السيرفرات
         };
 
-        const info = await ytdl.getInfo(videoId, ytdlOptions);
+        console.log(`Fetching info for video: ${videoId}`);
+        
+        const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, ytdlOptions);
         const formats = info.formats;
 
         // Get video formats with quality
@@ -68,17 +121,17 @@ app.get('/api/video/:videoId', async (req, res) => {
             f.url
         );
 
-        // Find the strongest audio (highest bitrate)
+        // Find the strongest audio
         const strongestAudio = audioFormats.reduce((best, current) => {
             return (!best || current.audioBitrate > best.audioBitrate) ? current : best;
         }, null);
 
-        // Get unique video qualities (remove duplicates by height)
+        // Get unique video qualities
         const uniqueVideoQualities = [];
         const seenHeights = new Set();
 
         videoFormats
-            .sort((a, b) => b.height - a.height) // Sort by height descending
+            .sort((a, b) => b.height - a.height)
             .forEach(format => {
                 if (!seenHeights.has(format.height)) {
                     seenHeights.add(format.height);
@@ -115,6 +168,37 @@ app.get('/api/video/:videoId', async (req, res) => {
             }
         });
 
+        // Clean up debug files
+        cleanupDebugFiles();
+
+    } catch (error) {
+        console.error('Error fetching video:', error.message);
+        console.error('Stack:', error.stack);
+        
+        // إرسال رسالة خطأ أكثر تفصيلاً في بيئة التطوير
+        const errorMessage = process.env.NODE_ENV === 'development' 
+            ? error.message 
+            : 'Please try again later';
+            
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch video information',
+            details: errorMessage,
+            // في بيئة التطوير، أضف المزيد من التفاصيل
+            ...(process.env.NODE_ENV === 'development' && {
+                debug: {
+                    message: error.message,
+                    code: error.code,
+                    statusCode: error.statusCode
+                }
+            })
+        });
+    }
+});
+
+// Function to clean up debug files
+function cleanupDebugFiles() {
+    try {
         const files = fs.readdirSync('.');
         files.forEach(file => {
             if (file.includes('player-script.js') || 
@@ -122,30 +206,33 @@ app.get('/api/video/:videoId', async (req, res) => {
                 file.match(/^\d+-.*\.(js|html)$/)) {
                 try {
                     fs.unlinkSync(file);
-                    // console.log(`🗑️  Cleaned up debug file: ${file}`);
                 } catch (err) {
                     // Ignore cleanup errors
                 }
             }
         });
-
-    } catch (error) {
-        
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch video information',
-            details: 'Please try again later'
-        });
+    } catch (err) {
+        // Ignore if can't read directory
     }
-});
+}
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        node: process.version,
+        memory: process.memoryUsage()
+    });
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-    console.error(err.stack);
+    console.error('Middleware error:', err.stack);
     res.status(500).json({
         success: false,
-        error: 'Something went wrong!'
+        error: 'Something went wrong!',
+        ...(process.env.NODE_ENV === 'development' && { details: err.message })
     });
 });
 
@@ -159,53 +246,20 @@ app.use('*', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`🚀 YouTube API is running on port ${PORT}`);
-        
-    try {
-        const files = fs.readdirSync('.');
-        files.forEach(file => {
-            if (file.includes('player-script.js') || 
-                file.includes('watch.html') || 
-                file.match(/^\d+-.*\.(js|html)$/)) {
-                try {
-                    fs.unlinkSync(file);
-                    console.log(`🗑️  Cleaned up debug file: ${file}`);
-                } catch (err) {
-                    // Ignore cleanup errors
-                }
-            }
-        });
-    } catch (err) {
-        // Ignore if can't read directory
-    }
+    console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    cleanupDebugFiles();
 });
 
-// Clean up debug files on exit
+// Clean up on exit
 process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down server...');
-    
-    const fs = require('fs');
-    try {
-        const files = fs.readdirSync('.');
-        files.forEach(file => {
-            if (file.includes('player-script.js') || 
-                file.includes('watch.html') || 
-                file.match(/^\d+-.*\.(js|html)$/)) {
-                try {
-                    fs.unlinkSync(file);
-                    console.log(`🗑️  Cleaned up: ${file}`);
-                } catch (err) {
-                    // Ignore cleanup errors
-                }
-            }
-        });
-    } catch (err) {
-        // Ignore cleanup errors
-    }
-    
+    cleanupDebugFiles();
     process.exit(0);
 });
 
-// Prevent unhandled promise rejections from showing warnings
-process.on('unhandledRejection', () => {});
+// Prevent unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
 
 module.exports = app;
